@@ -1,0 +1,121 @@
+from __future__ import annotations
+
+import asyncio
+
+from gpt2agent.backend import BackendClient
+from gpt2agent.tools._backend import async_get, async_post
+
+
+def register(mcp, client: BackendClient) -> None:
+    custom_instruction_write_lock = asyncio.Lock()
+
+    @mcp.tool()
+    async def custom_instructions_set(
+        about_user: str | None = None,
+        about_model: str | None = None,
+    ) -> dict:
+        """Overwrite ChatGPT custom instructions (read-modify-write — preserves fields not supplied)."""
+        fields = [
+            name
+            for name, value in (("about_user", about_user), ("about_model", about_model))
+            if value is not None
+        ]
+        if not fields:
+            raise ValueError("at least one custom-instruction field must be supplied")
+
+        # The endpoint accepts the full object, so serialize the entire
+        # read-modify-write window. Otherwise two concurrent partial updates can
+        # both preserve a stale value and the last POST silently loses a field.
+        async with custom_instruction_write_lock:
+            current = await async_get(
+                client,
+                "/backend-api/user_system_messages",
+                target_path="/backend-api/user_system_messages",
+            )
+            # None = empty-2xx glitch (backend.get contract): the current state is
+            # UNKNOWN, so blind-posting only the supplied fields would silently
+            # clear the other one. Refuse instead. ({} = known-empty is fine.)
+            if current is None:
+                raise RuntimeError(
+                    "could not read current custom instructions — refusing to "
+                    "overwrite; retry in a moment"
+                )
+            payload = {**current}
+            if about_user is not None:
+                payload["about_user_message"] = about_user
+            if about_model is not None:
+                payload["about_model_message"] = about_model
+            await async_post(
+                client,
+                "/backend-api/user_system_messages",
+                json=payload,
+                target_path="/backend-api/user_system_messages",
+            )
+        return {"updated": True, "fields": fields}
+
+    # memory_add is NOT registered as an MCP tool.
+    # SPIKE FINDING 2026-04-23: POST /backend-api/memories → 405 Method Not Allowed
+    # (Allow: GET only). PATCH and PUT also 405. Memory creation is model-initiated
+    # only — not available via REST. Exposing a tool that always raises misleads agents
+    # that introspect the tool list, so registration is intentionally skipped.
+    def memory_add(content: str) -> dict:  # noqa: F841 — kept as documentation
+        raise RuntimeError(
+            "POST /backend-api/memories is not supported — server returns 405 "
+            "Method Not Allowed (Allow: GET). Memory creation must go through "
+            "a ChatGPT conversation (model-initiated only)."
+        )
+
+    @mcp.tool()
+    async def codex_task_create(
+        repo_label: str,
+        prompt: str,
+        environment_id: str | None = None,
+        branch: str = "main",
+    ) -> dict:
+        """Create a new Codex task.
+
+        Resolves environment_id from repo_label if not supplied.
+        Verified payload shape (2026-04-23): POST /backend-api/codex/tasks
+        with new_task={environment_id, branch} + top-level input_items.
+        """
+        env_id = environment_id
+        if env_id is None:
+            data = await async_get(
+                client,
+                "/backend-api/codex/environments",
+                target_path="/backend-api/codex/environments",
+            ) or {}
+            envs = data if isinstance(data, list) else (data.get("environments") or [])
+            matches = [e for e in envs if e.get("label") == repo_label]
+            if len(matches) == 0:
+                available = [e.get("label") for e in envs]
+                raise ValueError(
+                    f"No Codex environment with label {repo_label!r}. Available: {available}"
+                )
+            if len(matches) > 1:
+                ids = [e.get("id") for e in matches]
+                raise ValueError(
+                    f"Ambiguous label {repo_label!r}: matches {len(matches)} environments "
+                    f"({ids}). Pass environment_id explicitly."
+                )
+            env_id = matches[0]["id"]
+
+        payload = {
+            "new_task": {
+                "environment_id": env_id,
+                "branch": branch,
+            },
+            "input_items": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"content_type": "text", "text": prompt}],
+                }
+            ],
+        }
+        return await async_post(
+            client,
+            "/backend-api/codex/tasks",
+            json=payload,
+            target_path="/backend-api/codex/tasks",
+        )

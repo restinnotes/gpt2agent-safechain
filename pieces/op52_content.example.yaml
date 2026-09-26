@@ -1,0 +1,21 @@
+piece_id: "op52"
+work_identity: "Chopin Ballade No.4 in F minor, Op.52"
+work_scope: "肖邦第四叙事曲 Op.52"
+generator_runs: 8
+generator_max_concurrency: 8
+prompt_suite_path: "../assets/prompt_suite_judge_restored/chatgpt_web_prompt_suite_CONTENT_JUDGE_RESTORED"
+runs_dir: "runs"
+max_attempts: 3
+provider:
+  name: gpt2agent
+  gpt2agent:
+    site_packages: "../vendor"
+  jobs:
+    generator:
+      model: gpt-5-6-thinking
+      thinking_effort: max
+      temporary: true
+    package:
+      model: gpt-5-6-thinking
+      thinking_effort: max
+      temporary: true
