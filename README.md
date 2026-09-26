@@ -1,5 +1,10 @@
 # gpt2agent-safechain
 
+2026-09-26 session update: one queued account worker, persistent account IDs and
+cookie jar, frontend prepare/conduit flow, and fail-fast protection cooldowns.
+See [audit and music-project integration](WEB_SESSION_AUDIT.md). No claim is
+made that an unofficial Web client prevents account flags or model fallback.
+
 Agent calls ChatGPT web-quota through a vendored `gpt2agent` transport, with
 anti-ban design so automated traffic stays human-scale.
 

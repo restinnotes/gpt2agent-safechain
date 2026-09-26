@@ -55,6 +55,12 @@ _ACCOUNT_PROTECTION_MARKERS = (
     "temporarily restricted",
     "为保障数据安全",
     "暂时限制",
+    "403",
+    "challenge",
+    "unusual activity",
+    "suspicious activity",
+    "account protection backoff",
+    "suspected chatgpt fallback",
 )
 _KNOWN_FALLBACK_MODEL_MARKERS = ("i-mini", "fallback")
 
@@ -180,8 +186,11 @@ def _load_gpt2agent(site_packages: str | None):
         runtime_sp = project_root / ".venv" / "Lib" / "site-packages"
         if runtime_sp.is_dir() and str(runtime_sp) not in sys.path:
             sys.path.insert(0, str(runtime_sp))
-        if site_packages and not sys.modules.get("gpt2agent"):
-            sp = Path(site_packages)
+        if not sys.modules.get("gpt2agent"):
+            sp = Path(site_packages) if site_packages else project_root / "vendor"
+            # Existing pieces configs name vendor/gpt2agent; Python needs its parent.
+            if sp.name == "gpt2agent" and (sp / "__init__.py").is_file():
+                sp = sp.parent
             if not sp.is_dir():
                 raise TransportUnavailableError(
                     f"gpt2agent site-packages dir not found: {sp}"
@@ -202,24 +211,53 @@ def _load_gpt2agent(site_packages: str | None):
 
 
 class _ConcurrentCalls:
-    """Per-turn client-scope guard under the provider account gate.
-
-    The provider's outer account gate bounds intellectual-turn concurrency. This
-    guard gives each entered scope a fresh BackendClient + ConversationClient
-    and tears the backend down when the scope exits.
-    """
+    """Serialize runtime access; retain the warm backend between successful turns."""
 
     def __init__(self, provider: "GPT2AgentProvider") -> None:
         self._provider = provider
 
     async def __aenter__(self):
+        await self._provider._runtime_gate.acquire()
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
         backend = self._provider._active_backend.get()
-        if backend is not None:
-            await asyncio.to_thread(self._provider._close_backend, backend)
+        cleanup_error = None
+        try:
+            runtime = getattr(backend, "_runtime", None)
+            try:
+                if runtime is not None and exc is not None and _looks_like_account_protection(exc):
+                    runtime.backoff()
+            except Exception as error:
+                cleanup_error = error
+            scope = self._provider._runtime_scope.get()
+            if scope is not None:
+                try:
+                    await scope.__aexit__(exc_type, exc, tb)
+                except Exception as error:
+                    cleanup_error = error
+                finally:
+                    self._provider._runtime_scope.set(None)
+            if backend is not None and (exc is not None or cleanup_error is not None):
+                try:
+                    close = getattr(backend, "aclose", None)
+                    if close is not None:
+                        await close()
+                    else:
+                        await asyncio.to_thread(self._provider._close_backend, backend)
+                except Exception as error:
+                    cleanup_error = error
+                finally:
+                    self._provider._backend = None
+        finally:
             self._provider._active_backend.set(None)
+            self._provider._runtime_gate.release()
+        if cleanup_error is not None:
+            if exc is None:
+                raise ProviderError.post_submit_ambiguous(
+                    "account runtime cleanup/persistence failed; refusing automatic re-submit"
+                ) from cleanup_error
+            _log.warning("Account runtime cleanup failed; retaining original submit-phase error")
         return False
 
 
@@ -230,8 +268,8 @@ class GPT2AgentProvider:
     ConversationClient are created lazily on first use.
 
     ``complete_chat`` is account-safe: calls have a small bounded concurrency
-    even when upper layers queue broad sampling work. Every turn provisions a fresh
-    BackendClient + ConversationClient and tears it down afterwards. A history
+    even when upper layers queue broad sampling work. A warm BackendClient is
+    retained; each turn gets isolated ConversationClient metadata. A history
     429/account-protection response opens a process-lifetime circuit breaker so
     queued work cannot keep probing the protected account.
 
@@ -247,17 +285,22 @@ class GPT2AgentProvider:
         self._site_packages = site_packages
         self._backend_mod: Any = None
         self._sse_mod: Any = None
+        self._backend: Any = None
+        self._runtime_gate = asyncio.Lock()
+        self._runtime_scope = contextvars.ContextVar("gpt2agent_runtime_scope", default=None)
         self._active_backend: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
             "gpt2agent_active_backend", default=None
         )
         try:
             self._max_active_turns = int(
-                os.environ.get("GPT2AGENT_MAX_ACTIVE_TURNS", "10")
+                os.environ.get("GPT2AGENT_MAX_ACTIVE_TURNS", "1")
             )
         except ValueError as exc:
             raise ValueError("GPT2AGENT_MAX_ACTIVE_TURNS must be an integer") from exc
         if self._max_active_turns < 1:
             raise ValueError("GPT2AGENT_MAX_ACTIVE_TURNS must be >= 1")
+        if self._max_active_turns != 1:
+            raise ValueError("GPT2AGENT_MAX_ACTIVE_TURNS must be 1 for a shared account runtime")
         self._active_turn_gate = asyncio.Semaphore(self._max_active_turns)
         self._lock = _ConcurrentCalls(self)
         self._sentinel_factory: Any = None
@@ -286,10 +329,24 @@ class GPT2AgentProvider:
         backend_mod, sse_mod = _load_gpt2agent(self._site_packages)
         self._backend_mod = backend_mod
         self._sse_mod = sse_mod
-        backend = await asyncio.to_thread(backend_mod.BackendClient)
-        conv = sse_mod.ConversationClient(backend)
+        if self._backend is None:
+            self._backend = await asyncio.to_thread(backend_mod.BackendClient)
+        backend = self._backend
         self._active_backend.set(backend)
+        runtime = getattr(backend, "_runtime", None)
+        if runtime is not None:
+            scope = runtime.account_scope(backend._session)
+            await scope.__aenter__()
+            self._runtime_scope.set(scope)
+        conv = sse_mod.ConversationClient(backend)
         return backend, conv
+
+    async def aclose(self) -> None:
+        """Close at worker shutdown, after queued calls have finished."""
+        async with self._runtime_gate:
+            if self._backend is not None:
+                await self._backend.aclose()
+                self._backend = None
 
     @staticmethod
     def _close_backend(backend: Any) -> None:
@@ -627,7 +684,7 @@ class GPT2AgentProvider:
             turn_meta = dict(getattr(conv, "last_turn_metadata", {}) or {})
             result_meta = {
                 key: turn_meta.get(key)
-                for key in ("conversation_id", "message_id", "temporary")
+                for key in ("conversation_id", "message_id", "temporary", "banner_info")
                 if turn_meta.get(key) is not None
             }
             if submitted_at is not None:
@@ -637,6 +694,24 @@ class GPT2AgentProvider:
             model_slugs = _resolved_model_slugs(turn_meta)
             if model_slugs:
                 result_meta["resolved_model_slugs"] = model_slugs
+            # Keep the raw server turn metadata so later analysis can bind the
+            # model slug to this turn's assistant message id (the merged slug
+            # list alone cannot prove which model wrote the text).
+            if turn_meta.get("server_ste_metadata") is not None:
+                result_meta["server_ste_metadata"] = turn_meta.get("server_ste_metadata")
+            # record (never block) web use, so callers can tell internal-knowledge turns that searched anyway
+            message_meta = ((turn_meta.get("message") or {}).get("metadata") or {}) if isinstance(turn_meta.get("message"), dict) else {}
+            if message_meta.get("content_references") or message_meta.get("search_result_groups"):
+                result_meta["web_citations"] = len(message_meta.get("content_references") or [])
+                result_meta["search_result_groups"] = len(message_meta.get("search_result_groups") or [])
+            fallback_slugs = [slug for slug in model_slugs if any(
+                marker in slug.lower() for marker in _KNOWN_FALLBACK_MODEL_MARKERS)]
+            if fallback_slugs:
+                self._account_protection_latch = "server-reported fallback after submit"
+                raise ProviderError(
+                    "suspected ChatGPT fallback; server-reported model slug(s): " + ", ".join(fallback_slugs),
+                    retryable=False, ambiguous=False, phase=ProviderPhase.POST_SUBMIT,
+                )
             # Detect an implausibly fast heavy-reasoning result before artifact
             # handling.  Previously a fallback response that omitted the ZIP
             # raised "missing artifact" first and bypassed the account-safety

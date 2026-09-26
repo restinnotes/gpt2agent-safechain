@@ -13,11 +13,12 @@ from typing import AsyncIterator, Awaitable, Callable
 from uuid import uuid4
 
 from curl_cffi import requests as curl_requests
-from curl_cffi.requests import AsyncSession
 from websockets.asyncio.client import connect as websocket_connect
 
 from gpt2agent._log_redact import redact_error as _redact_error
 from gpt2agent.backend import BackendClient, _BASE
+from gpt2agent.runtime import IMPERSONATE
+from gpt2agent.frontend import decoded_lines
 from gpt2agent.sentinel import SentinelGate  # noqa: F401  (used in stream)
 
 _log = logging.getLogger(__name__)
@@ -365,13 +366,14 @@ def _build_payload(
     payload: dict = {
         "action": "next",
         "messages": [],
-        "parent_message_id": str(uuid4()),
+        "parent_message_id": "client-created-root",
         "model": model,
         "conversation_mode": {"kind": "primary_assistant"},
         "force_paragen": False,
         "force_rate_limit": False,
         "force_use_sse": True,
-        "timezone_offset_min": -480,
+        "timezone_offset_min": 0,
+        "timezone": "UTC",
         "history_and_training_disabled": temporary,
         "system_hints": [],
     }
@@ -538,10 +540,10 @@ def _build_heavy_dr_payload(query: str, *, model: str | None = None) -> dict:
                 },
             }
         ],
-        "parent_message_id": str(uuid4()),
+        "parent_message_id": "client-created-root",
         "model": model or HEAVY_DR_MODEL,
         "client_prepare_state": "success",
-        "timezone_offset_min": -480,
+        "timezone_offset_min": 0,
         "timezone": "UTC",
         "conversation_mode": {"kind": "primary_assistant"},
         "enable_message_followups": True,
@@ -561,6 +563,42 @@ def _build_heavy_dr_payload(query: str, *, model: str | None = None) -> dict:
 
 
 class ConversationClient:
+    async def _prepare_conversation(self, session, payload: dict, headers: dict) -> None:
+        """Fail closed before submit; never fall back to the legacy endpoint."""
+        runtime = self._backend._runtime
+        runtime.check_backoff()
+        payload["timezone"] = runtime.timezone
+        payload["timezone_offset_min"] = runtime.timezone_offset_min
+        payload.setdefault("supports_buffering", True)
+        payload.setdefault("supported_encodings", ["v1"])
+        for message in payload.get("messages") or []:
+            metadata = message.setdefault("metadata", {})
+            metadata.setdefault("serialization_metadata", {"custom_symbol_offsets": []})
+            message.setdefault("create_time", round(time.time(), 3))
+            if "user_timezone" in metadata:
+                metadata["user_timezone"] = runtime.timezone
+        keys = ("action", "fork_from_shared_post", "parent_message_id", "conversation_id", "model",
+                "timezone", "timezone_offset_min", "history_and_training_disabled", "conversation_mode",
+                "system_hints", "supports_buffering", "supported_encodings", "gizmo_id")
+        body = {key: payload[key] for key in keys if key in payload}
+        body.setdefault("fork_from_shared_post", False)
+        prepare_headers = dict(headers, Accept="application/json")
+        prepare_headers["x-conduit-token"] = "no-token"
+        try:
+            response = await session.post(_F_CONV_URL + "/prepare", headers=prepare_headers,
+                                          json=body, timeout=30)
+            runtime.note_response(response)
+            if response.status_code != 200:
+                raise RuntimeError(f"HTTP {response.status_code}")
+            result = response.json()
+            token = result.get("conduit_token") if isinstance(result, dict) else None
+            if not isinstance(token, str) or not token:
+                raise RuntimeError("missing conduit_token")
+        except Exception as exc:
+            raise RuntimeError(f"f/conversation/prepare failed before submit: {_redact_error(str(exc))}") from exc
+        headers["x-conduit-token"] = token
+        payload["client_prepare_state"] = "success"
+
     def __init__(self, backend: BackendClient) -> None:
         self._backend = backend
         self.last_turn_metadata: dict = {}
@@ -593,7 +631,8 @@ class ConversationClient:
                 "file_name": path.name,
                 "file_size": size,
                 "use_case": "my_files",
-                "timezone_offset_min": -480,
+                "timezone_offset_min": self._backend._runtime.timezone_offset_min,
+                "timezone": self._backend._runtime.timezone,
                 "reset_rate_limits": False,
                 "supports_direct_azure_multipart": False,
                 "mime_type": mime_type,
@@ -684,7 +723,7 @@ class ConversationClient:
                     destination,
                     headers=direct_headers,
                     data=path.read_bytes(),
-                    impersonate="chrome131",
+                    impersonate=IMPERSONATE,
                     verify=True,
                     timeout=300,
                 )
@@ -757,6 +796,7 @@ class ConversationClient:
         headers["Content-Type"] = "application/json"
 
         sentinel = await SentinelGate(self._backend).get_tokens()
+        headers["OAI-Client-Version"] = self._backend._session.headers.get("OAI-Client-Version", "")
         headers["Openai-Sentinel-Chat-Requirements-Token"] = sentinel[
             "chat-requirements"
         ]
@@ -788,11 +828,12 @@ class ConversationClient:
         if tools:
             payload["tools"] = tools
 
-        async with AsyncSession(impersonate="chrome131", verify=True) as s:
+        async with self._backend.async_session() as s:
+            await self._prepare_conversation(s, payload, headers)
             if pre_submit is not None:
                 await pre_submit()
             resp = await s.post(
-                _CONV_URL,
+                _F_CONV_URL,
                 headers=headers,
                 json=payload,
                 timeout=int(os.environ.get("GPT2AGENT_SSE_TIMEOUT_SECONDS", "900")),
@@ -806,6 +847,7 @@ class ConversationClient:
                 self._backend._session.cookies.update(resp.cookies)
             except Exception:
                 _log.debug("Unable to transfer live-turn cookies", exc_info=True)
+            self._backend._runtime.note_response(resp)
             if resp.status_code == 401:
                 body = _safe_body(resp)
                 raise RuntimeError(
@@ -859,7 +901,7 @@ class ConversationClient:
                     last_assistant_msg_id = message["id"]
                     self.last_turn_metadata["message"] = message
 
-            async for raw_line in resp.aiter_lines():
+            async for raw_line in decoded_lines(resp):
                 if isinstance(raw_line, bytes):
                     raw_line = raw_line.decode("utf-8", errors="replace")
                 line = raw_line.strip()
@@ -881,6 +923,15 @@ class ConversationClient:
                 cid = obj.get("conversation_id")
                 if cid and not _conversation_id:
                     _conversation_id = cid
+
+                if obj.get("type") == "server_ste_metadata":
+                    self.last_turn_metadata["server_ste_metadata"] = obj.get("metadata") or {}
+                if obj.get("type") == "conversation_detail_metadata":
+                    banner = obj.get("banner_info") or {}
+                    self.last_turn_metadata["banner_info"] = banner
+                    if any(marker in str(banner).lower() for marker in ("suspicious", "unusual", "account_sharing_degrade")):
+                        self._backend._runtime.backoff()
+                        raise RuntimeError("unusual activity reported in conversation metadata")
 
                 # Heavy reasoning turns move from the root SSE stream to a
                 # short-lived Celsius websocket topic.
@@ -906,6 +957,8 @@ class ConversationClient:
                         # None (key present), so chained .get() would AttributeError.
                         vmsg = v.get("message") or {}
                         _track_message_lifecycle(vmsg)
+                        if (vmsg.get("author") or {}).get("role") != "assistant":
+                            continue
                         msg_id = vmsg.get("id")
                         is_new = _reset_if_new_msg(msg_id)
                         parts = (vmsg.get("content") or {}).get("parts") or []
@@ -1063,7 +1116,10 @@ class ConversationClient:
             if final_text is not None:
                 text = final_text
         captured_messages = self.last_turn_metadata.get("messages", [])
+        transport_metadata = {key: self.last_turn_metadata[key] for key in (
+            "server_ste_metadata", "banner_info") if key in self.last_turn_metadata}
         self.last_turn_metadata = {
+            **transport_metadata,
             "conversation_id": conv_id,
             "message_id": message_id,
             "temporary": temporary,
@@ -1282,7 +1338,7 @@ class ConversationClient:
         conversation_id: str | None = None
         processing_text = ""
 
-        async with AsyncSession(impersonate="chrome131", verify=True) as s:
+        async with self._backend.async_session() as s:
             resp = await s.post(
                 _CONV_URL, headers=headers, json=payload, timeout=300, stream=True,
             )
@@ -1460,7 +1516,7 @@ class ConversationClient:
         done_received = False
         message_completed = False
 
-        async with AsyncSession(impersonate="chrome131", verify=True) as s:
+        async with self._backend.async_session() as s:
             resp = await s.post(
                 _CONV_URL, headers=headers, json=payload, timeout=300, stream=True,
             )
@@ -1631,7 +1687,7 @@ class ConversationClient:
                 parent_message_id=last_assistant_msg_id,
             )
 
-            async with AsyncSession(impersonate="chrome131", verify=True) as s:
+            async with self._backend.async_session() as s:
                 resp = await s.post(
                     _CONV_URL,
                     headers=headers,
@@ -1639,6 +1695,7 @@ class ConversationClient:
                     timeout=1800,
                     stream=True,
                 )
+                self._backend._runtime.note_response(resp)
                 if resp.status_code == 401:
                     raise RuntimeError("401 Unauthorized — run `codex login`")
                 if resp.status_code == 403:
@@ -2106,7 +2163,7 @@ class ConversationClient:
                 _apply_path(state["last_path"], "append", v, events)
                 return
 
-        async with AsyncSession(impersonate="chrome131", verify=True) as s:
+        async with self._backend.async_session() as s:
             resp = await s.post(
                 _F_CONV_URL,
                 headers=headers,
@@ -2114,6 +2171,7 @@ class ConversationClient:
                 timeout=1800,
                 stream=True,
             )
+            self._backend._runtime.note_response(resp)
             if resp.status_code == 401:
                 raise RuntimeError("401 Unauthorized — run `codex login`")
             if resp.status_code == 403:

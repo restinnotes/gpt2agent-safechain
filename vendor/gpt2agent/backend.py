@@ -12,6 +12,7 @@ from typing import Any
 from curl_cffi import requests
 
 from gpt2agent._log_redact import redact_error
+from gpt2agent.runtime import AccountRuntime, IMPERSONATE, UA, SEC_CH_UA, account_key
 
 
 _BASE = "https://chatgpt.com"
@@ -132,24 +133,37 @@ class BackendClient:
         except OSError:
             self._token_mtime = None
         self._token_lock = threading.Lock()
+        self._runtime = AccountRuntime(token, source)
         # Keep TLS fingerprint + User-Agent aligned across backend / sentinel /
         # conversation streams. Cloudflare's bot manager cross-checks them and
         # will 403 mixed fingerprints.
-        self._session = requests.Session(impersonate="chrome131", verify=True)
+        self._session = requests.Session(impersonate=IMPERSONATE, verify=True)
         self._session.headers.update(
             {
-                "User-Agent": _CHROME_131_UA,
+                "User-Agent": UA,
                 "Authorization": f"Bearer {token}",
-                "OAI-Device-Id": _get_device_id(),
-                "OAI-Session-Id": str(uuid.uuid4()),
-                "OAI-Language": "en-US",
-                "OAI-Client-Version": _CLIENT_VERSION,
-                "OAI-Client-Build-Number": _CLIENT_BUILD,
+                "OAI-Device-Id": self._runtime.device_id,
+                "OAI-Session-Id": self._runtime.session_id,
+                "OAI-Language": self._runtime.locale,
+                "OAI-Client-Version": self._runtime.client_version,
+                "OAI-Client-Build-Number": self._runtime.client_build,
+                "Accept-Language": self._runtime.locale + "," + self._runtime.locale.split("-")[0] + ";q=0.9",
+                "sec-ch-ua": SEC_CH_UA,
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
                 "Origin": _BASE,
                 "Referer": _BASE + "/",
                 "Accept": "*/*",
             }
         )
+        self._runtime.load_cookies(self._session)
+
+    def async_session(self):
+        return self._runtime.async_session(self._session)
+
+    async def aclose(self) -> None:
+        await self._runtime.aclose()
+        self._session.close()
 
     def _reload_token_if_stale(self) -> None:
         """Re-evaluate token sources and refresh the Authorization header.
@@ -173,6 +187,8 @@ class BackendClient:
                 mtime = None
 
             authorization = f"Bearer {token}"
+            if account_key(token, source) != self._runtime.key:
+                raise RuntimeError("credential account changed; close and recreate the provider before submitting")
             if (
                 source == self._token_source
                 and mtime == self._token_mtime
@@ -190,6 +206,7 @@ class BackendClient:
         target_path: str | None = None,
         target_route: str | None = None,
     ) -> Any:
+        self._runtime.check_backoff()
         self._reload_token_if_stale()
         extra: dict[str, str] = {}
         if target_path is not None:
@@ -198,6 +215,7 @@ class BackendClient:
             extra["X-OpenAI-Target-Route"] = target_route
 
         r = self._session.get(_BASE + path, headers=extra, timeout=20)
+        self._runtime.note_response(r)
 
         if r.status_code == 401:
             raise RuntimeError("401 Unauthorized — token expired, run `codex login`")
@@ -228,6 +246,7 @@ class BackendClient:
         target_path: str | None = None,
         target_route: str | None = None,
     ) -> Any:
+        self._runtime.check_backoff()
         self._reload_token_if_stale()
         extra: dict[str, str] = {"Content-Type": "application/json"}
         if target_path is not None:
@@ -236,6 +255,7 @@ class BackendClient:
             extra["X-OpenAI-Target-Route"] = target_route
 
         r = self._session.post(_BASE + path, headers=extra, json=json, timeout=30)
+        self._runtime.note_response(r)
 
         if r.status_code == 401:
             raise RuntimeError("401 Unauthorized — token expired, run `codex login`")

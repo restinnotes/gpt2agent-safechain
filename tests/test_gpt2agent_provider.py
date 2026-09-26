@@ -217,6 +217,14 @@ def test_transport_gate_runs_after_sentinel_and_immediately_before_post(monkeypa
             self._session = type(
                 "Session", (), {"headers": {}, "cookies": Cookies()}
             )()
+            self._runtime = type("Runtime", (), {
+                "timezone": "UTC", "timezone_offset_min": 0,
+                "check_backoff": lambda self: None,
+                "note_response": lambda self, response: None,
+            })()
+
+        def async_session(self):
+            return Session()
 
         def _reload_token_if_stale(self):
             return None
@@ -233,6 +241,9 @@ def test_transport_gate_runs_after_sentinel_and_immediately_before_post(monkeypa
         status_code = 200
         cookies = Cookies()
 
+        def json(self):
+            return {"conduit_token": "conduit"}
+
         async def aiter_lines(self):
             yield "data: [DONE]"
 
@@ -247,7 +258,11 @@ def test_transport_gate_runs_after_sentinel_and_immediately_before_post(monkeypa
             return False
 
         async def post(self, url, **_kwargs):
-            assert url.endswith("/backend-api/conversation")
+            if url.endswith("/prepare"):
+                events.append("prepare")
+                return Response()
+            assert url.endswith("/backend-api/f/conversation")
+            assert _kwargs["headers"]["x-conduit-token"] == "conduit"
             events.append("post")
             return Response()
 
@@ -266,9 +281,8 @@ def test_transport_gate_runs_after_sentinel_and_immediately_before_post(monkeypa
         ]
 
     monkeypatch.setattr(sse_mod, "SentinelGate", Gate)
-    monkeypatch.setattr(sse_mod, "AsyncSession", Session)
     assert asyncio.run(consume()) == []
-    assert events == ["sentinel", "gate", "post"]
+    assert events == ["sentinel", "prepare", "gate", "post"]
 
 
 def test_transport_does_not_detail_poll_empty_temporary_handoff(monkeypatch):
@@ -302,12 +316,11 @@ def test_transport_does_not_detail_poll_empty_temporary_handoff(monkeypatch):
     assert result == ""
 
 
-def test_parallel_callers_keep_distinct_clients(monkeypatch):
+def test_parallel_callers_queue_and_reuse_backend_with_distinct_turn_metadata(monkeypatch):
     active = 0
     max_active = 0
     backends = []
     conversations = []
-    two_active = asyncio.Event()
 
     class Backend:
         def __init__(self):
@@ -331,9 +344,6 @@ def test_parallel_callers_keep_distinct_clients(monkeypatch):
                 await pre_submit()
             active += 1
             max_active = max(max_active, active)
-            if active == 2:
-                two_active.set()
-            await asyncio.wait_for(two_active.wait(), timeout=2)
             await asyncio.sleep(0)
             active -= 1
             return "complete"
@@ -359,10 +369,10 @@ def test_parallel_callers_keep_distinct_clients(monkeypatch):
 
     results = asyncio.run(run_calls())
 
-    assert max_active == 2
-    assert len(backends) == 2
+    assert max_active == 1
+    assert len(backends) == 1
     assert len(conversations) == 2
-    assert conversations[0].backend is not conversations[1].backend
+    assert conversations[0].backend is conversations[1].backend
     assert len({result.meta["conversation_id"] for result in results}) == 2
 
 

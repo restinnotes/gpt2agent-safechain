@@ -66,6 +66,7 @@ def classify_conversation_phase(exc: BaseException) -> ProviderPhase:
     if (
         "chat-requirements/prepare" in lowered
         or "chat-requirements/finalize" in lowered
+        or "f/conversation/prepare failed before submit" in lowered
     ):
         return ProviderPhase.PRE_SUBMIT
     return ProviderPhase.POST_SUBMIT_AMBIGUOUS

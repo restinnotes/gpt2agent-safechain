@@ -448,20 +448,21 @@ def _generate_answer(seed: str, diff: str, config: list) -> tuple[str, bool]:
     )
 
 
-def solve_pow(seed: str, difficulty: str, user_agent: str) -> str:
-    config = build_config(user_agent)
+def solve_pow(seed: str, difficulty: str, user_agent: str, *, config: list | None = None) -> str:
+    config = config if config is not None else build_config(user_agent)
     answer, _solved = _generate_answer(seed, difficulty, config)
     if not _solved:
         import logging
 
         logging.getLogger(__name__).warning(
             "POW solver did not find an answer within the iteration budget — "
-            "falling back to stub token; request may be challenged."
+            "stopping before submit."
         )
+        return ""
     return "gAAAAAB" + answer
 
 
-def get_requirements_token(user_agent: str) -> str:
-    config = build_config(user_agent)
+def get_requirements_token(user_agent: str, *, config: list | None = None) -> str:
+    config = config if config is not None else build_config(user_agent)
     require, _ = _generate_answer(format(random.random()), "0fffff", config)
     return "gAAAAAC" + require

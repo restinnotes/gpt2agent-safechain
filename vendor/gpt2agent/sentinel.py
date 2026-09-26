@@ -8,8 +8,6 @@ import logging
 import time
 from typing import TYPE_CHECKING
 
-from curl_cffi.requests import AsyncSession
-
 from gpt2agent._log_redact import redact_error as _redact_error
 from gpt2agent._vendored import pow as _pow
 
@@ -53,33 +51,25 @@ class SentinelGate:
         prepare/finalize per send).
         """
         async with _TOKEN_FETCH_LOCK:
-            last_err: Exception | None = None
-            for attempt in range(1, 4):
-                try:
-                    out, _ = await self._fetch_tokens()
-                    return out
-                except RuntimeError as e:
-                    last_err = e
-                    if any(code in str(e) for code in ("522", "504", "502", "503")) and attempt < 3:
-                        await asyncio.sleep(2.0 * attempt)
-                        continue
-                    raise
-            if last_err:
-                raise last_err
+            out, _ = await self._fetch_tokens()
+            return out
 
     async def _fetch_tokens(self) -> tuple[dict[str, str], int | None]:
+        await self._backend._runtime.warmup(self._backend._session)
         headers = dict(self._backend._session.headers)
         headers["Content-Type"] = "application/json"
         headers["Accept"] = "*/*"
 
         ua = headers.get("User-Agent") or _CHAT_UA
-        p = _pow.get_requirements_token(ua)
+        config = self._backend._runtime.requirements_config(ua)
+        p = _pow.get_requirements_token(ua, config=config)
 
         url = "https://chatgpt.com/backend-api/sentinel/chat-requirements"
 
-        async with AsyncSession(impersonate="chrome131", verify=True) as s:
+        async with self._backend.async_session() as s:
             r = await s.post(url + "/prepare", headers=headers, json={"p": p}, timeout=30)
 
+            self._backend._runtime.note_response(r)
             if r.status_code != 200:
                 body = r.text if hasattr(r, "text") else str(r.content)
                 raise RuntimeError(
@@ -106,6 +96,10 @@ class SentinelGate:
                     f"{_redact_error(json.dumps(resp, ensure_ascii=False))}"
                 )
 
+            # Requirement metadata is not itself a refusal. Keep the accepted
+            # prepare/finalize exchange; only a successful finalize-issued token
+            # authorizes the next stage. HTTP refusal and missing tokens fail closed.
+
             out: dict[str, str] = {"chat-requirements": "", "proof": ""}
 
             pow_block = resp.get("proofofwork") or {}
@@ -114,7 +108,7 @@ class SentinelGate:
                 diff = pow_block.get("difficulty")
                 if not seed or not diff:
                     raise RuntimeError(f"sentinel POW missing seed/difficulty: {pow_block}")
-                proof = await asyncio.to_thread(_pow.solve_pow, seed, diff, ua)
+                proof = await asyncio.to_thread(_pow.solve_pow, seed, diff, ua, config=config)
                 if not proof:
                     raise RuntimeError("required POW challenge could not be solved")
                 out["proof"] = proof
@@ -125,6 +119,7 @@ class SentinelGate:
             if out["proof"]:
                 finalize["proofofwork"] = out["proof"]
             r2 = await s.post(url + "/finalize", headers=headers, json=finalize, timeout=30)
+        self._backend._runtime.note_response(r2)
         if r2.status_code != 200:
             body = r2.text if hasattr(r2, "text") else str(r2.content)
             raise RuntimeError(

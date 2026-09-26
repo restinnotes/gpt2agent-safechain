@@ -25,8 +25,13 @@ the pristine upstream source in:
 - `__init__.py` — package metadata
 - `__main__.py` — accepted entrypoint
 
-The transport-critical modules `backend.py`, `sentinel.py`, `server.py` and
-`sse.py` are byte-identical to the upstream `0.0.11` source.
+The original snapshot's transport-critical modules were byte-identical to
+upstream `0.0.11`. The 2026-09-26 session patch changes `backend.py`,
+`sentinel.py`, `sse.py` and `_vendored/pow.py`, and adds `runtime.py` and
+`frontend.py`. It selectively references upstream `e911a3a` (0.0.23), without
+replacing the accepted safechain protocol/artifact layer or importing the
+upstream simulation/bridge/geo/automatic-retry modules. See
+`WEB_SESSION_AUDIT.md` at the repository root for the exact scope and limitations.
 
 ## Runtime wiring
 
